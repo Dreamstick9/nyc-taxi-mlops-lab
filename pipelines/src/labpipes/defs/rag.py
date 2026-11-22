@@ -4,11 +4,12 @@
 
 - wiki_pages: the published pages, fetched with the ETag stored last time: an unchanged page costs a 304
   and no body. Pages no longer published are deleted with their chunks.
-- wiki_chunks: LLM chunking (decision 015). The chat model is shown the page as numbered sentences and
-  answers only with the sentence numbers where a new chunk starts; the chunks keep the page's exact words.
-  Each chunk is at most MAX_TOKENS. If the answer is unusable, the page is split with
-  labpipes.chunking.chunk_markdown(MAX_TOKENS, FALLBACK_OVERLAP) instead, and that is recorded. A changed
-  page's old chunks (and vectors) are deleted; ids are Chunk.content_hash, so unchanged text keeps its id.
+- wiki_chunks: the given chunker, labpipes.chunking.chunk_markdown(SIMPLE_MAX_TOKENS, SIMPLE_OVERLAP)
+  (decision 015). LLM chunking (the chat model picks sentence split points) is kept but switched off
+  (CHUNKER = "llm" turns it back on): on 2026-11-22 it cut the 16 pages into 83 one-sentence chunks.
+  Each page remembers which chunker and settings made its chunks (CHUNKING_VERSION), so changing them
+  re-chunks every page on the next run. A changed page's old chunks (and vectors) are deleted; ids are
+  Chunk.content_hash, so unchanged text keeps its id.
 - wiki_embeddings: embeds only chunks without a vector (nomic-embed-text, 768 dimensions, "search_document:"
   added by the `embed` resource), stored as pgvector vector(768) with an HNSW cosine index (decision 016).
 - every_chunk_has_a_vector: blocking check. ingest_wiki: the job (scripts/dagster-run.sh ingest_wiki);
@@ -27,12 +28,24 @@ from ..resources import LlmChat, LlmEmbed, RagStore, WikiApi
 
 # ======================================================================================================
 # THE STUDENT'S DECISIONS (decisions 015 and 016; schedule chosen on 2026-11-22).
+CHUNKER = "simple"  # "simple": chunk_markdown below; "llm": LLM split points (kept, switched off)
+SIMPLE_MAX_TOKENS = 256  # one chunk per page on today's wiki (largest page 181 tokens)
+SIMPLE_OVERLAP = 0
+# LLM chunking, used only when CHUNKER == "llm":
 MAX_TOKENS = 128  # largest chunk the LLM may make (body only, without the title/heading line)
 FALLBACK_OVERLAP = 32  # chunk_markdown overlap when the LLM's answer is unusable
 LLM_TEMPERATURE = 0.0  # same page -> same split, so re-runs keep chunk ids
 INDEX = "hnsw"  # decision 016: HNSW, cosine distance
 SCHEDULE = "0 6 * * *"  # daily at 06:00 UTC
 # ======================================================================================================
+
+
+def chunking_version() -> str:
+    """Which chunker and settings make chunks now. A page chunked with another version is re-chunked."""
+    if CHUNKER == "llm":
+        return f"llm:{MAX_TOKENS}:{FALLBACK_OVERLAP}:t{LLM_TEMPERATURE:g}"
+    return f"simple:{SIMPLE_MAX_TOKENS}:{SIMPLE_OVERLAP}"
+
 
 DIMENSIONS = 768
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(\[*_`-])")
@@ -46,7 +59,11 @@ SCHEMA = [
     f"""create table if not exists rag.chunks (
          id text primary key, page_id text not null references rag.pages(id) on delete cascade,
          idx int not null, heading text not null, content text not null, tokens int not null,
-         method text not null check (method in ('llm', 'fallback')), embedding vector({DIMENSIONS}))""",
+         method text not null, embedding vector({DIMENSIONS}))""",
+    # Added after the first deploy: which chunker made a page's chunks, and 'simple' as a method.
+    "alter table rag.pages add column if not exists chunked_with text",
+    "alter table rag.chunks drop constraint if exists chunks_method_check",
+    "alter table rag.chunks add constraint chunks_method_check check (method in ('simple', 'llm', 'fallback'))",
     "create index if not exists chunks_page_id on rag.chunks (page_id)",
     f"create index if not exists chunks_embedding_{INDEX} on rag.chunks using {INDEX} (embedding vector_cosine_ops)",
 ]
@@ -193,11 +210,13 @@ class RagDb:
         if ids:
             self._run("delete from rag.pages where id = any(%s)", (ids,))  # chunks go with them (cascade)
 
-    def pages_to_chunk(self) -> list[tuple[str, str, str, str]]:
-        """(id, title, body, etag) of pages whose current version hasn't been chunked yet."""
-        return self._run("select id, title, body, etag from rag.pages where chunked_etag is distinct from etag order by id", fetch=True)
+    def pages_to_chunk(self, version: str) -> list[tuple[str, str, str, str]]:
+        """(id, title, body, etag) of pages not yet chunked in their current version, or chunked by
+        another chunker or settings than `version`."""
+        return self._run("select id, title, body, etag from rag.pages where chunked_etag is distinct from etag "
+                         "or chunked_with is distinct from %s order by id", (version,), fetch=True)
 
-    def replace_chunks(self, page_id: str, etag: str, chunks: list[Chunk], method: str) -> tuple[int, int]:
+    def replace_chunks(self, page_id: str, etag: str, chunks: list[Chunk], method: str, version: str) -> tuple[int, int]:
         """The page's chunks become exactly `chunks`; a chunk whose id already exists keeps its vector.
         Returns (kept, added). One transaction, so a page is never half-chunked."""
         ids = [c.content_hash(page_id) for c in chunks]
@@ -213,7 +232,7 @@ class RagDb:
                     cur.execute("insert into rag.chunks (id, page_id, idx, heading, content, tokens, method) values (%s, %s, %s, %s, %s, %s, %s)",
                                 (cid, page_id, c.index, c.heading, c.text, c.tokens, method))
                     added += 1
-            cur.execute("update rag.pages set chunked_etag = %s where id = %s", (etag, page_id))
+            cur.execute("update rag.pages set chunked_etag = %s, chunked_with = %s where id = %s", (etag, version, page_id))
         self.conn.commit()
         return len(existing & set(ids)), added
 
@@ -224,12 +243,14 @@ class RagDb:
         self._run("update rag.chunks set embedding = %s::vector where id = %s", (vector_literal(vector), chunk_id))
 
     def counts(self) -> dict[str, int]:
-        (pages, chunks, missing, llm, fallback, empty), = self._run(
+        (pages, chunks, missing, simple, llm, fallback, empty), = self._run(
             """select (select count(*) from rag.pages), count(*), count(*) filter (where embedding is null),
-                      count(*) filter (where method = 'llm'), count(*) filter (where method = 'fallback'),
+                      count(*) filter (where method = 'simple'), count(*) filter (where method = 'llm'),
+                      count(*) filter (where method = 'fallback'),
                       (select count(*) from rag.pages p where not exists (select 1 from rag.chunks c where c.page_id = p.id))
                from rag.chunks""", fetch=True)
-        return {"pages": pages, "chunks": chunks, "without_vector": missing, "llm_chunks": llm, "fallback_chunks": fallback,
+        return {"pages": pages, "chunks": chunks, "without_vector": missing, "simple_chunks": simple, "llm_chunks": llm,
+                "fallback_chunks": fallback,
                 "pages_without_chunks": empty}
 
 
@@ -269,14 +290,17 @@ def wiki_pages(context: dg.AssetExecutionContext, wiki: WikiApi, rag: RagStore) 
 
 @dg.asset(deps=[wiki_pages], group_name="wiki", kinds={"postgres"})
 def wiki_chunks(context: dg.AssetExecutionContext, rag: RagStore, chat: LlmChat) -> dg.MaterializeResult:
-    """Chunks of every page whose current version isn't chunked yet: the LLM picks the split points,
-    chunk_markdown is the fallback. Old chunks of a changed page are deleted."""
-    db = open_db(rag)
-    todo = db.pages_to_chunk()
+    """Chunks of every page not yet chunked in its current version or with the current chunker settings
+    (chunk_markdown by default; LLM split points when CHUNKER == "llm"). Old chunks are deleted."""
+    db, version = open_db(rag), chunking_version()
+    todo = db.pages_to_chunk(version)
     added = kept = fallbacks = 0
     for page_id, title, body, etag in todo:
-        chunks, method, why = chunk_page(chat, title, body)
-        k, a = db.replace_chunks(page_id, etag, chunks, method)
+        if CHUNKER == "llm":
+            chunks, method, why = chunk_page(chat, title, body)
+        else:
+            chunks, method, why = chunk_markdown(title, body, SIMPLE_MAX_TOKENS, SIMPLE_OVERLAP), "simple", ""
+        k, a = db.replace_chunks(page_id, etag, chunks, method, version)
         kept, added = kept + k, added + a
         if method == "fallback":
             fallbacks += 1
@@ -284,8 +308,9 @@ def wiki_chunks(context: dg.AssetExecutionContext, rag: RagStore, chat: LlmChat)
         context.log.info(f"{page_id}: {len(chunks)} chunks by {method} ({a} new)")
     counts = db.counts()
     return dg.MaterializeResult(metadata={
-        "pages_chunked": len(todo), "chunks_added": added, "chunks_kept": kept, "pages_fallback": fallbacks,
-        "chunks_total": counts["chunks"], "llm_chunks": counts["llm_chunks"], "fallback_chunks": counts["fallback_chunks"],
+        "chunking": version, "pages_chunked": len(todo), "chunks_added": added, "chunks_kept": kept, "pages_fallback": fallbacks,
+        "chunks_total": counts["chunks"], "simple_chunks": counts["simple_chunks"], "llm_chunks": counts["llm_chunks"],
+        "fallback_chunks": counts["fallback_chunks"],
     })
 
 
@@ -320,7 +345,7 @@ def every_chunk_has_a_vector(rag: RagStore) -> dg.AssetCheckResult:
 ingest_wiki = dg.define_asset_job(
     "ingest_wiki",
     selection=dg.AssetSelection.assets(wiki_pages, wiki_chunks, wiki_embeddings),
-    description="Fetch changed wiki pages (ETags), LLM-chunk them, embed new chunks; blocking: every chunk has a vector.",
+    description="Fetch changed wiki pages (ETags), chunk them, embed new chunks; blocking: every chunk has a vector.",
 )
 
 ingest_wiki_daily = dg.ScheduleDefinition(

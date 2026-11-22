@@ -119,7 +119,8 @@ class FakeDb:
 
     def upsert_page(self, page):
         old = self.pages.get(page.id, {})
-        self.pages[page.id] = {"title": page.title, "etag": page.etag, "body": page.body, "chunked_etag": old.get("chunked_etag")}
+        self.pages[page.id] = {"title": page.title, "etag": page.etag, "body": page.body, "chunked_etag": old.get("chunked_etag"),
+                               "chunked_with": old.get("chunked_with")}
 
     def delete_pages(self, ids):
         for i in ids:
@@ -127,20 +128,23 @@ class FakeDb:
             for cid in [c for c, v in self.chunks.items() if v["page_id"] == i]:
                 del self.chunks[cid]
 
-    def pages_to_chunk(self):
-        return [(k, p["title"], p["body"], p["etag"]) for k, p in sorted(self.pages.items()) if p["chunked_etag"] != p["etag"]]
+    def pages_to_chunk(self, version):
+        return [(k, p["title"], p["body"], p["etag"]) for k, p in sorted(self.pages.items())
+                if p["chunked_etag"] != p["etag"] or p.get("chunked_with") != version]
 
-    def replace_chunks(self, page_id, etag, chunks, method):
+    def replace_chunks(self, page_id, etag, chunks, method, version):
         ids = [c.content_hash(page_id) for c in chunks]
         existing = {c for c, v in self.chunks.items() if v["page_id"] == page_id}
         for cid in existing - set(ids):
             del self.chunks[cid]
         added = 0
         for cid, c in zip(ids, chunks, strict=True):
-            if cid not in self.chunks:
+            if cid in self.chunks:
+                self.chunks[cid]["method"] = method  # as RagDb: same text keeps its id and vector
+            else:
                 self.chunks[cid] = {"page_id": page_id, "content": c.text, "method": method, "embedding": None}
                 added += 1
-        self.pages[page_id]["chunked_etag"] = etag
+        self.pages[page_id]["chunked_etag"], self.pages[page_id]["chunked_with"] = etag, version
         return len(existing & set(ids)), added
 
     def chunks_without_vector(self):
@@ -152,6 +156,7 @@ class FakeDb:
     def counts(self):
         return {"pages": len(self.pages), "chunks": len(self.chunks),
                 "without_vector": sum(v["embedding"] is None for v in self.chunks.values()),
+                "simple_chunks": sum(v["method"] == "simple" for v in self.chunks.values()),
                 "llm_chunks": sum(v["method"] == "llm" for v in self.chunks.values()),
                 "fallback_chunks": sum(v["method"] == "fallback" for v in self.chunks.values()),
                 "pages_without_chunks": sum(not any(v["page_id"] == p for v in self.chunks.values()) for p in self.pages)}
@@ -215,7 +220,9 @@ def test_first_run_fetches_chunks_and_embeds_everything(world):
     assert r.success
     assert meta(r, "wiki_pages")["pages_fetched"] == 2 and meta(r, "wiki_pages")["pages_unchanged"] == 0
     assert meta(r, "wiki_chunks")["pages_chunked"] == 2
-    assert meta(r, "wiki_embeddings")["chunks_embedded"] == len(world.chunks) == 3  # airport: 2 by the LLM, quiet: 1 sentence
+    assert meta(r, "wiki_chunks")["chunking"] == "simple:256:0"
+    assert meta(r, "wiki_embeddings")["chunks_embedded"] == len(world.chunks) == 2  # one whole page each (simple 256/0)
+    assert all(v["method"] == "simple" for v in world.chunks.values())
     checks = r.get_asset_check_evaluations()
     assert checks[0].passed
 
@@ -243,7 +250,11 @@ def test_a_changed_page_replaces_its_old_chunks_and_a_removed_page_goes(world):
     assert meta(r, "wiki_embeddings")["chunks_embedded"] == 1
 
 
-def test_fallback_is_recorded(world):
+def test_llm_mode_splits_and_records_fallback(world, monkeypatch):
+    monkeypatch.setattr(rag, "CHUNKER", "llm")
+    r = run()
+    assert meta(r, "wiki_chunks")["chunking"] == "llm:128:32:t0" and meta(r, "wiki_chunks")["llm_chunks"] == 3
+    world.pages.clear(), world.chunks.clear()
     r = run(chat=FakeChat(llm_host="x", reply="no idea", calls=[]))
     assert meta(r, "wiki_chunks")["pages_fallback"] == 1  # quiet-hours is one sentence: no LLM call needed
     assert any(v["method"] == "fallback" for v in world.chunks.values())
@@ -267,3 +278,18 @@ def test_job_and_schedule():
     assert ingest_wiki.name == "ingest_wiki"
     assert ingest_wiki_daily.cron_schedule == "0 6 * * *" and ingest_wiki_daily.execution_timezone == "UTC"
     assert json.loads(json.dumps(rag.SCHEMA))[-1].startswith("create index if not exists chunks_embedding_hnsw")
+
+
+def test_changing_the_chunker_rechunks_every_page(world, monkeypatch):
+    run()
+    simple_ids = set(world.chunks)
+    monkeypatch.setattr(rag, "CHUNKER", "llm")
+    r = run()
+    assert meta(r, "wiki_pages")["pages_fetched"] == 0  # nothing new on the wiki
+    assert meta(r, "wiki_chunks")["pages_chunked"] == 2  # but both pages are re-chunked with the new chunker
+    assert len(world.chunks) == 3  # airport split in two by the LLM; quiet-hours (one sentence) keeps its id
+    assert all(v["method"] == "llm" for v in world.chunks.values())
+    monkeypatch.setattr(rag, "CHUNKER", "simple")
+    r = run()
+    assert meta(r, "wiki_chunks")["pages_chunked"] == 2 and set(world.chunks) == simple_ids  # same text -> same ids
+    assert meta(r, "wiki_embeddings")["chunks_embedded"] == 1  # only airport changed text; quiet-hours kept its vector
