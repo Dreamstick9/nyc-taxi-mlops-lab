@@ -14,6 +14,23 @@ Three SLOs on the rider-facing `/predict` route, each over 30 days (`observabili
 
 Each alert is multi-window, multi-burn-rate on a 1% error budget: it **pages** when the budget burns 14.4x too fast over both 1 h and 5 min (`for: 2m`), and opens a **ticket** at 6x over both 6 h and 30 min (`for: 15m`). Blue and green, and both hosts, are summed together. A window with no `/predict` traffic records nothing, so no traffic never pages.
 
+### Seen firing (2026-11-22, S5 step 5)
+
+Steady rider traffic at 3 requests/s on the app host (`deploy/traffic.py`), then `serving-champion` stopped:
+
+| Time (UTC) | What happened |
+| --- | --- |
+| 11:51:39 | healthy traffic, every quote from champion v1 |
+| 11:54:39 | **break**: `docker stop lab-serving-serving-champion-1` |
+| 11:54:55 | riders get `static-median` 12.25 min, still HTTP 200 |
+| 11:56:40 | `PredictModelAnsweredBurnRate` page and ticket go **pending** (2 min after the break) |
+| 11:59:02 | **page fires** (4 min 23 s after the break) |
+| 11:59:02 | **fix**: `docker start lab-serving-serving-champion-1` |
+| 11:59:24 | riders get champion v1 again (22 s after the fix) |
+| 12:06:01 | page resolved |
+
+1,551 requests, all HTTP 200: 741 from the model, 810 from the fallback. `PredictAvailabilityBurnRate` did not fire, because nothing returned a 5xx; only the model-answered SLO saw this outage. It paged faster than the unit tests' ~10 minutes because the 1-hour window held only 3 minutes of healthy traffic before the break.
+
 ## Rejected alternative
 
 Stricter objectives: 99.9% availability (about 43 minutes of failure a month) and 99% under 100 ms.
