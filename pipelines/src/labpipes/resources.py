@@ -251,6 +251,25 @@ class LlmEmbed(dg.ConfigurableResource):
         return out
 
 
+class LlmChat(dg.ConfigurableResource):
+    """llama.cpp's chat server on the LLM host (runtime.yaml: llm-chat, port 8080), OpenAI-style. S6 uses
+    it to choose where wiki pages split (defs/rag.py: LLM chunking). The server answers one request at a
+    time, so a long call here makes the app's /assist wait."""
+
+    llm_host: str
+    port: int = 8080
+    timeout: float = 300.0
+
+    def complete(self, messages: list[dict], temperature: float = 0.0, max_tokens: int = 256) -> str:
+        """The assistant message's text for these messages."""
+        import urllib.request
+
+        body = json.dumps({"messages": messages, "temperature": temperature, "max_tokens": max_tokens}).encode()
+        req = urllib.request.Request(f"http://{self.llm_host}:{self.port}/v1/chat/completions", body, {"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=self.timeout) as r:
+            return json.load(r)["choices"][0]["message"]["content"] or ""
+
+
 class RagStore(dg.ConfigurableResource):
     """The `rag` database on RDS (pgvector), as the RDS admin user from Secrets Manager (lab/rds)."""
 
