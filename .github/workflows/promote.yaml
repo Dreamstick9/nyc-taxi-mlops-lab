@@ -1,0 +1,114 @@
+# Promote (S3): move the MLflow `champion` alias to a version the pipeline evaluated, after a reviewer
+# approves it in the `production` environment. The only place in this repo that moves `champion`.
+#
+#   gh workflow run promote.yaml                  promote whatever `challenger` points at
+#   gh workflow run promote.yaml -f version=3     promote a specific version (e.g. to roll the model back)
+#
+# Steps: refuse a version without the evaluation tags contracts/mlflow.yaml requires (the pipeline's
+# eval_report writes them), record the outgoing champion on the registered model and on both versions,
+# move the alias, POST /reload on serving-champion (decision 010: the old model answers until the new
+# one has loaded), then check /predict through the live app says champion and the promoted version.
+#
+# Dispatch only: nothing from a pull request runs on the app host.
+name: promote
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Model version to promote (default the current challenger)
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: promote
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: [self-hosted, lab-app]
+    environment: production
+    env:
+      VERSION: ${{ inputs.version }}
+      ACTOR: ${{ github.actor }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Move the champion alias
+        id: alias
+        run: |
+          [ -z "$VERSION" ] || [[ "$VERSION" =~ ^[0-9]+$ ]] || { echo "version must be a number, got '$VERSION'" >&2; exit 2; }
+          # The tags every evaluated version carries, straight from the contract (list under version_tags:).
+          required=$(awk '/^version_tags:/{f=1; next} f && /^[^ ]/{f=0} f && /^ *- /{print $2}' contracts/mlflow.yaml | paste -sd, -)
+          [ -n "$required" ] || { echo "no version_tags found in contracts/mlflow.yaml" >&2; exit 1; }
+          # MLflow is reached from the serving container: it has the client and MLFLOW_TRACKING_URI.
+          docker exec -i -e VERSION="$VERSION" -e REQUIRED="$required" -e ACTOR="$ACTOR" -e RUN_URL="$RUN_URL" \
+            lab-serving-serving-champion-1 python - > /tmp/promote.env <<'PY'
+          import datetime, os, sys
+          from mlflow import MlflowClient
+
+          name = "trip-duration"  # contracts/mlflow.yaml: registered_model
+          c = MlflowClient()
+          aliases = c.get_registered_model(name).aliases
+          version = os.environ["VERSION"] or aliases.get("challenger")
+          if not version:
+              sys.exit("no version given and no challenger alias: run the train_model job first")
+          mv = c.get_model_version(name, version)
+          missing = [t for t in os.environ["REQUIRED"].split(",") if t not in mv.tags]
+          if missing:
+              sys.exit(f"version {version} was not evaluated by the pipeline (missing tags {missing}): refusing to promote")
+          old = aliases.get("champion")
+          when = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+          if old == str(version):
+              print(f"version {version} is already champion", file=sys.stderr)
+          else:
+              # Record the outgoing champion before moving anything, so a rollback knows where to go.
+              c.set_registered_model_tag(name, "previous_champion", old or "none")
+              if old:
+                  c.set_model_version_tag(name, old, "replaced_by", str(version))
+                  c.set_model_version_tag(name, old, "retired_at", when)
+              c.set_model_version_tag(name, str(version), "promoted_at", when)
+              c.set_model_version_tag(name, str(version), "promoted_by", os.environ["ACTOR"])
+              c.set_model_version_tag(name, str(version), "promoted_from", old or "none")
+              c.set_model_version_tag(name, str(version), "promotion_run", os.environ["RUN_URL"])
+              c.set_registered_model_alias(name, "champion", str(version))
+          print(f"version={version}")
+          print(f"previous={old or 'none'}")
+          print(f"mae_min={mv.tags.get('mae_min')}")
+          print(f"compared_mae_min={mv.tags.get('champion_mae_min')}")
+          PY
+          cat /tmp/promote.env
+          cat /tmp/promote.env >> "$GITHUB_OUTPUT"
+      - name: Serving picks up the new champion
+        run: deploy/web.sh reload champion
+      - name: Check /predict through the live app
+        env:
+          PROMOTED: ${{ steps.alias.outputs.version }}
+        run: |
+          # Traefik health-checks serving-champion every 5 s; a champion that had no model before needs one check.
+          for _ in $(seq 1 20); do
+            curl -fsS -H 'Content-Type: application/json' http://localhost/predict \
+              -d '{"pickup_zone_id": 132, "dropoff_zone_id": 230, "pickup_datetime": "2024-03-08T17:05:00"}' > /tmp/predict.json || true
+            jq -e --arg v "$PROMOTED" '.model.alias == "champion" and (.model.version | tostring) == $v' /tmp/predict.json >/dev/null && break
+            sleep 3
+          done
+          cat /tmp/predict.json; echo
+          jq -e --arg v "$PROMOTED" '.model.alias == "champion" and (.model.version | tostring) == $v' /tmp/predict.json
+      - name: Summary
+        if: always()
+        env:
+          PROMOTED: ${{ steps.alias.outputs.version }}
+          PREVIOUS: ${{ steps.alias.outputs.previous }}
+          MAE: ${{ steps.alias.outputs.mae_min }}
+          COMPARED: ${{ steps.alias.outputs.compared_mae_min }}
+        run: |
+          {
+            echo "### champion: v${PREVIOUS} -> v${PROMOTED}"
+            echo "- holdout MAE ${MAE} min (compared against ${COMPARED} at evaluation)"
+            echo "- roll the model back: \`gh workflow run promote.yaml -f version=${PREVIOUS}\`"
+            echo '```json'
+            deploy/web.sh status
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,8 +1,15 @@
-# CD: deploy the image CI just built onto the app host, through the self-hosted runner there.
+# CD: blue-green deploy of the image CI just built onto the app host, through the self-hosted runner there.
 # The runner uses the host's instance profile; no AWS keys anywhere.
 #
+# Deploy (decision 011): start the new image on the idle colour, smoke-test it there (deploy/web.sh smoke:
+# /version shows the expected commit, /predict answers), then switch all traffic to it automatically. The
+# old colour keeps running, so going back is a switch, not a deploy.
+#
+# Rollback: Run workflow with `rollback` ticked. Smoke-tests the other colour (still running the previous
+# version) and switches traffic to it. Nothing is built or pulled.
+#
 # Triggered by workflow_run, so this file always runs from the default branch: a pull request can't
-# change what executes on your host. The `if` below also rejects CI runs that weren't pushes to
+# change what executes on your host. The `if`s below also reject CI runs that weren't pushes to
 # this repository; a fork's PR from a branch named "main" would otherwise match `branches: [main]`.
 name: cd
 
@@ -14,8 +21,12 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Image tag to deploy, e.g. to roll back (default sha-<first 7 of the commit>)
+        description: Image tag to deploy to the idle colour (default sha-<first 7 of the commit>)
         required: false
+      rollback:
+        description: Roll back instead of deploying (switch traffic to the other, still-running colour)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -28,8 +39,9 @@ concurrency:
 jobs:
   deploy-app:
     if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.conclusion == 'success' &&
+      (github.event_name == 'workflow_dispatch' && !inputs.rollback) ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.event == 'push' &&
        github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: [self-hosted, lab-app]
@@ -45,20 +57,84 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Deploy
+      - name: Prepare Traefik and pick the idle colour
+        id: colours
+        run: |
+          deploy/web.sh prepare
+          live=$(deploy/web.sh live)
+          if [ "$live" = blue ]; then target=green; else target=blue; fi
+          other=$([ "$target" = blue ] && echo green || echo blue)
+          echo "live=$live target=$target"
+          {
+            echo "live=$live"
+            echo "target=$target"
+            echo "other=$other"
+            echo "other_tag=$(deploy/web.sh tag "$other")"
+          } >> "$GITHUB_OUTPUT"
+      - name: Deploy to the idle colour
+        env:
+          TARGET: ${{ steps.colours.outputs.target }}
+          OTHER: ${{ steps.colours.outputs.other }}
+          OTHER_TAG: ${{ steps.colours.outputs.other_tag }}
         run: |
           export IMAGE_PREFIX="ghcr.io/${GITHUB_REPOSITORY,,}"
-          export IMAGE_TAG="${TAG:-sha-${SHA::7}}"
-          docker compose -f deploy/compose.app.yaml pull
-          docker compose -f deploy/compose.app.yaml up -d --wait --remove-orphans
-      - name: Smoke test
+          new_tag="${TAG:-sha-${SHA::7}}"
+          # The live colour keeps the tag it runs; only the idle one changes.
+          export "${TARGET^^}_TAG=$new_tag" "${OTHER^^}_TAG=$OTHER_TAG"
+          echo "$TARGET -> $new_tag ($OTHER stays on $OTHER_TAG)"
+          docker compose -f deploy/compose.web.yaml pull "app-$TARGET"
+          # --remove-orphans: the first run with this stack replaces S0's single `app` container.
+          docker compose -f deploy/compose.web.yaml up -d --wait --remove-orphans "app-$TARGET"
+      - name: Smoke test the idle colour
+        env:
+          TARGET: ${{ steps.colours.outputs.target }}
         run: |
-          # Traefik answers 404 for a moment after it first starts, until its file provider loads the
-          # route; --retry alone doesn't retry a 404.
-          curl -fsS --retry 10 --retry-all-errors --retry-delay 2 http://localhost/version | tee /tmp/version.json
-          echo
-          if [ -n "$TAG" ]; then
-            jq -e --arg t "$TAG" '.image_tag == $t' /tmp/version.json
-          else
-            jq -e --arg sha "$SHA" '.git_sha == $sha' /tmp/version.json
-          fi
+          if [ -n "$TAG" ]; then deploy/web.sh smoke "$TARGET"; else deploy/web.sh smoke "$TARGET" "$SHA"; fi
+      - name: Switch traffic
+        env:
+          TARGET: ${{ steps.colours.outputs.target }}
+        run: deploy/web.sh switch "$TARGET"
+      - name: Live check
+        run: |
+          # Traefik picks up the new weights from its file provider within a second or two.
+          for _ in $(seq 1 15); do
+            curl -fsS http://localhost/version > /tmp/version.json && \
+              if [ -n "$TAG" ]; then jq -e --arg t "$TAG" '.image_tag == $t' /tmp/version.json;
+              else jq -e --arg sha "$SHA" '.git_sha == $sha' /tmp/version.json; fi && break
+            sleep 2
+          done
+          cat /tmp/version.json; echo
+          if [ -n "$TAG" ]; then jq -e --arg t "$TAG" '.image_tag == $t' /tmp/version.json;
+          else jq -e --arg sha "$SHA" '.git_sha == $sha' /tmp/version.json; fi
+          deploy/web.sh status | tee -a "$GITHUB_STEP_SUMMARY"
+
+  rollback-app:
+    # Manual dispatch only. The workflow_run checks are explicit: no CI run (and so no fork's PR) can
+    # ever start this job.
+    if: >-
+      github.event_name == 'workflow_dispatch' && inputs.rollback &&
+      !github.event.workflow_run.event && !github.event.workflow_run.head_repository
+    runs-on: [self-hosted, lab-app]
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Switch back to the other colour
+        run: |
+          start=$(date +%s%N)
+          live=$(deploy/web.sh live)
+          case "$live" in
+            blue) back=green ;;
+            green) back=blue ;;
+            *) echo "no live colour yet: nothing to roll back to" >&2; exit 1 ;;
+          esac
+          [ "$(deploy/web.sh tag "$back")" != none ] || { echo "$back isn't running: nothing to roll back to" >&2; exit 1; }
+          deploy/web.sh smoke "$back"
+          deploy/web.sh switch "$back"
+          for _ in $(seq 1 15); do
+            [ "$(curl -fsS http://localhost/version | jq -r .image_tag)" = "$(deploy/web.sh tag "$back")" ] && break
+            sleep 1
+          done
+          ms=$(( ($(date +%s%N) - start) / 1000000 ))
+          secs="$((ms / 1000)).$(printf '%03d' $((ms % 1000)))"
+          echo "rolled back $live -> $back in ${secs}s"
+          echo "### Rollback: $live -> $back in ${secs}s" >> "$GITHUB_STEP_SUMMARY"
+          deploy/web.sh status | tee -a "$GITHUB_STEP_SUMMARY"

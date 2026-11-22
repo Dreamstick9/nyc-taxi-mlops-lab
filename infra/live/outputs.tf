@@ -25,3 +25,8 @@ output "artifact_bucket" {
 }
 
 
+
+# S3: serving on the app host reaches MLflow on the platform host by its private IP (MLFLOW_TRACKING_URI).
+output "platform_private_ip" {
+  value = module.platform.private_ip
+}
