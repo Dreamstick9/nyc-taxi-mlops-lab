@@ -81,6 +81,20 @@ services:
       retries: 12
       start_period: 30s
 
+  # Boot-time wake (S4, decision 012): at every boot, start RDS if it's stopped and resume Redshift if
+  # it's paused, as LabRole, then sleep. Nothing else (deploy/wake.sh says what it never does).
+  # Logs: docker logs platform-wake-1
+  wake:
+    image: public.ecr.aws/aws-cli/aws-cli:2.37.7
+    restart: unless-stopped
+    environment:
+      AWS_REGION: us-east-1
+      RDS_ID: lab
+      REDSHIFT_ID: ${REDSHIFT_CLUSTER_ID:-lab}
+    entrypoint: ["/bin/sh", "/wake.sh"]
+    volumes:
+      - ./wake.sh:/wake.sh:ro
+
 
 volumes:
   dagster-storage:
