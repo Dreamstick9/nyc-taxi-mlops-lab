@@ -60,6 +60,10 @@ jobs:
       - name: Prepare Traefik and pick the idle colour
         id: colours
         run: |
+          # Lower-cased: GHCR names can't have capitals. Exported for this step (web.sh prepare reads
+          # compose.web.yaml) and, through GITHUB_ENV, for every later one.
+          export IMAGE_PREFIX="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "IMAGE_PREFIX=$IMAGE_PREFIX" >> "$GITHUB_ENV"
           deploy/web.sh prepare
           live=$(deploy/web.sh live)
           if [ "$live" = blue ]; then target=green; else target=blue; fi
@@ -77,7 +81,6 @@ jobs:
           OTHER: ${{ steps.colours.outputs.other }}
           OTHER_TAG: ${{ steps.colours.outputs.other_tag }}
         run: |
-          export IMAGE_PREFIX="ghcr.io/${GITHUB_REPOSITORY,,}"
           new_tag="${TAG:-sha-${SHA::7}}"
           # The live colour keeps the tag it runs; only the idle one changes.
           export "${TARGET^^}_TAG=$new_tag" "${OTHER^^}_TAG=$OTHER_TAG"
