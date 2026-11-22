@@ -2,4 +2,222 @@
 # Prometheus rule format: https://prometheus.io/docs/prometheus/latest/configuration/recording_rules/
 # Metric names are contracts/metrics.yaml's. `make check` runs promtool on this file and on any
 # *.test.yaml next to it.
-groups: []
+#
+# One group per SLO in observability/slo.yaml. Each group records the SLI's error ratio (the share of
+# /predict events that spent error budget) over the windows its alerts use, then alerts on the burn
+# rate: how many times faster than "exactly on budget" the budget is going. Objective 99% over 30 days,
+# so the error budget is 1 - 0.99 = 0.01 and a burn rate of B means an error ratio of B * 0.01.
+#
+# Multi-window, multi-burn-rate (Google SRE workbook, ch. 5):
+#   page:   burn rate 14.4 over 1h AND over 5m  (2% of the 30-day budget gone in an hour)
+#   ticket: burn rate 6    over 6h AND over 30m (5% of the 30-day budget gone in six hours)
+# The long window says it's serious, the short one says it's still happening (so an alert stops soon
+# after the problem does).
+#
+# Aggregation: every ratio is a sum() over all series, so the `host` external label, the scrape's
+# instance/job and the blue/green containers all collapse into one number per SLO: riders don't care
+# which colour answered, and a colour switch mid-window doesn't split the ratio.
+#
+# No traffic: the denominator is filtered with `> 0`, so a window with no /predict requests records
+# nothing (not 0, not NaN) and no alert can fire. The numerator falls back to `or vector(0)` so that a
+# window with traffic but no bad events records 0 instead of nothing.
+groups:
+  - name: slo-predict-availability
+    interval: 1m
+    rules:
+      # Bad = /predict answered with a 5xx. Good = everything else (the SLI is non-5xx / all).
+      - record: sli:predict_availability_errors:ratio_rate5m
+        labels: { slo: predict-availability }
+        expr: |
+          (sum(rate(lab_http_requests_total{route="/predict",code=~"5.."}[5m])) or vector(0))
+          /
+          (sum(rate(lab_http_requests_total{route="/predict"}[5m])) > 0)
+      - record: sli:predict_availability_errors:ratio_rate30m
+        labels: { slo: predict-availability }
+        expr: |
+          (sum(rate(lab_http_requests_total{route="/predict",code=~"5.."}[30m])) or vector(0))
+          /
+          (sum(rate(lab_http_requests_total{route="/predict"}[30m])) > 0)
+      - record: sli:predict_availability_errors:ratio_rate1h
+        labels: { slo: predict-availability }
+        expr: |
+          (sum(rate(lab_http_requests_total{route="/predict",code=~"5.."}[1h])) or vector(0))
+          /
+          (sum(rate(lab_http_requests_total{route="/predict"}[1h])) > 0)
+      - record: sli:predict_availability_errors:ratio_rate6h
+        labels: { slo: predict-availability }
+        expr: |
+          (sum(rate(lab_http_requests_total{route="/predict",code=~"5.."}[6h])) or vector(0))
+          /
+          (sum(rate(lab_http_requests_total{route="/predict"}[6h])) > 0)
+
+      - alert: PredictAvailabilityBurnRate
+        expr: |
+          sli:predict_availability_errors:ratio_rate1h{slo="predict-availability"} > (14.4 * 0.01)
+          and
+          sli:predict_availability_errors:ratio_rate5m{slo="predict-availability"} > (14.4 * 0.01)
+        for: 2m
+        labels:
+          severity: page
+          slo: predict-availability
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of /predict requests were 5xx over the last hour (objective: at most 1%)"
+          description: >-
+            Page: the availability budget is burning over 14.4x too fast (1 h), and it's still happening
+            (5 min). Check `deploy/web.sh status` (live colour, its tag), `docker ps` and the live app
+            container's logs over SSM, and the "App responses by route and code" panel. A deploy just
+            before this? `deploy/web.sh switch` back to the other colour.
+      - alert: PredictAvailabilityBurnRate
+        expr: |
+          sli:predict_availability_errors:ratio_rate6h{slo="predict-availability"} > (6 * 0.01)
+          and
+          sli:predict_availability_errors:ratio_rate30m{slo="predict-availability"} > (6 * 0.01)
+        for: 15m
+        labels:
+          severity: ticket
+          slo: predict-availability
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of /predict requests were 5xx over the last 6 hours (objective: at most 1%)"
+          description: >-
+            Ticket: the availability budget is burning over 6x too fast (6 h), still true over 30 min.
+            Not an emergency yet: look at the "App responses by route and code" panel and the app
+            containers' logs for a recurring error.
+
+  - name: slo-predict-latency
+    interval: 1m
+    rules:
+      # Bad = a /predict request that took 0.25 s or more inside the app (not in the le="0.25" bucket).
+      # If the le="0.25" bucket is ever missing (dropped by budget.alloy), every request counts as slow
+      # and this pages: loud rather than silently blind.
+      - record: sli:predict_latency_errors:ratio_rate5m
+        labels: { slo: predict-latency }
+        expr: |
+          (
+            sum(rate(lab_http_request_duration_seconds_count{route="/predict"}[5m]))
+            -
+            (sum(rate(lab_http_request_duration_seconds_bucket{route="/predict",le="0.25"}[5m])) or vector(0))
+          )
+          /
+          (sum(rate(lab_http_request_duration_seconds_count{route="/predict"}[5m])) > 0)
+      - record: sli:predict_latency_errors:ratio_rate30m
+        labels: { slo: predict-latency }
+        expr: |
+          (
+            sum(rate(lab_http_request_duration_seconds_count{route="/predict"}[30m]))
+            -
+            (sum(rate(lab_http_request_duration_seconds_bucket{route="/predict",le="0.25"}[30m])) or vector(0))
+          )
+          /
+          (sum(rate(lab_http_request_duration_seconds_count{route="/predict"}[30m])) > 0)
+      - record: sli:predict_latency_errors:ratio_rate1h
+        labels: { slo: predict-latency }
+        expr: |
+          (
+            sum(rate(lab_http_request_duration_seconds_count{route="/predict"}[1h]))
+            -
+            (sum(rate(lab_http_request_duration_seconds_bucket{route="/predict",le="0.25"}[1h])) or vector(0))
+          )
+          /
+          (sum(rate(lab_http_request_duration_seconds_count{route="/predict"}[1h])) > 0)
+      - record: sli:predict_latency_errors:ratio_rate6h
+        labels: { slo: predict-latency }
+        expr: |
+          (
+            sum(rate(lab_http_request_duration_seconds_count{route="/predict"}[6h]))
+            -
+            (sum(rate(lab_http_request_duration_seconds_bucket{route="/predict",le="0.25"}[6h])) or vector(0))
+          )
+          /
+          (sum(rate(lab_http_request_duration_seconds_count{route="/predict"}[6h])) > 0)
+
+      - alert: PredictLatencyBurnRate
+        expr: |
+          sli:predict_latency_errors:ratio_rate1h{slo="predict-latency"} > (14.4 * 0.01)
+          and
+          sli:predict_latency_errors:ratio_rate5m{slo="predict-latency"} > (14.4 * 0.01)
+        for: 2m
+        labels:
+          severity: page
+          slo: predict-latency
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of /predict requests took 250 ms or more over the last hour (objective: at most 1%)"
+          description: >-
+            Page: the latency budget is burning over 14.4x too fast (1 h), and it's still happening
+            (5 min). Check the "The app's calls to serving, by outcome" (timeouts?) and "Serving latency
+            p95" panels, `deploy/web.sh status`, and the serving containers (`docker ps`, `docker stats`)
+            over SSM.
+      - alert: PredictLatencyBurnRate
+        expr: |
+          sli:predict_latency_errors:ratio_rate6h{slo="predict-latency"} > (6 * 0.01)
+          and
+          sli:predict_latency_errors:ratio_rate30m{slo="predict-latency"} > (6 * 0.01)
+        for: 15m
+        labels:
+          severity: ticket
+          slo: predict-latency
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of /predict requests took 250 ms or more over the last 6 hours (objective: at most 1%)"
+          description: >-
+            Ticket: the latency budget is burning over 6x too fast (6 h), still true over 30 min. Look at
+            serving latency by version and the app host's CPU and memory panels for a slow drift.
+
+  - name: slo-predict-model-answered
+    interval: 1m
+    rules:
+      # Bad = a quote that didn't come from the model (source="fallback": the static median answered).
+      - record: sli:predict_model_answered_errors:ratio_rate5m
+        labels: { slo: predict-model-answered }
+        expr: |
+          (sum(rate(lab_predictions_total{source!="model"}[5m])) or vector(0))
+          /
+          (sum(rate(lab_predictions_total[5m])) > 0)
+      - record: sli:predict_model_answered_errors:ratio_rate30m
+        labels: { slo: predict-model-answered }
+        expr: |
+          (sum(rate(lab_predictions_total{source!="model"}[30m])) or vector(0))
+          /
+          (sum(rate(lab_predictions_total[30m])) > 0)
+      - record: sli:predict_model_answered_errors:ratio_rate1h
+        labels: { slo: predict-model-answered }
+        expr: |
+          (sum(rate(lab_predictions_total{source!="model"}[1h])) or vector(0))
+          /
+          (sum(rate(lab_predictions_total[1h])) > 0)
+      - record: sli:predict_model_answered_errors:ratio_rate6h
+        labels: { slo: predict-model-answered }
+        expr: |
+          (sum(rate(lab_predictions_total{source!="model"}[6h])) or vector(0))
+          /
+          (sum(rate(lab_predictions_total[6h])) > 0)
+
+      - alert: PredictModelAnsweredBurnRate
+        expr: |
+          sli:predict_model_answered_errors:ratio_rate1h{slo="predict-model-answered"} > (14.4 * 0.01)
+          and
+          sli:predict_model_answered_errors:ratio_rate5m{slo="predict-model-answered"} > (14.4 * 0.01)
+        for: 2m
+        labels:
+          severity: page
+          slo: predict-model-answered
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of quotes came from the fallback, not the model, over the last hour (objective: at most 1%)"
+          description: >-
+            Page: the model-answered budget is burning over 14.4x too fast (1 h), and it's still
+            happening (5 min). Serving is down, slow or has no model: check `deploy/web.sh status` (what
+            serving has loaded), `docker ps` for serving-champion over SSM, and the "The app's calls to
+            serving, by outcome" panel (timeout, unavailable, error).
+      - alert: PredictModelAnsweredBurnRate
+        expr: |
+          sli:predict_model_answered_errors:ratio_rate6h{slo="predict-model-answered"} > (6 * 0.01)
+          and
+          sli:predict_model_answered_errors:ratio_rate30m{slo="predict-model-answered"} > (6 * 0.01)
+        for: 15m
+        labels:
+          severity: ticket
+          slo: predict-model-answered
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of quotes came from the fallback, not the model, over the last 6 hours (objective: at most 1%)"
+          description: >-
+            Ticket: the model-answered budget is burning over 6x too fast (6 h), still true over 30 min.
+            Look at "The app's calls to serving, by outcome" for intermittent timeouts and at serving's
+            reloads.

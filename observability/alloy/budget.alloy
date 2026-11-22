@@ -5,6 +5,10 @@
 // Rules are Prometheus relabelling (https://grafana.com/docs/alloy/latest/reference/components/prometheus/prometheus.relabel/):
 //   rule { source_labels = ["__name__"]  regex = "node_(cpu|memory)_.*"  action = "keep" }
 //   rule { regex = "id"  action = "labeldrop" }
+//
+// Decision 014 ("Moderate", about 2,500 series for app + platform): keep every service metric, keep
+// the host's and containers' CPU, memory, disk and network, drop everything else and every label that
+// changes on every deploy. Rules run in order; regexes match the whole value.
 
 declare "host" {
 	argument "forward_to" { }
@@ -12,7 +16,30 @@ declare "host" {
 	prometheus.relabel "rules" {
 		forward_to = argument.forward_to.value
 
-		// Your rules for the host's series: CPU? memory? disk? which network devices?
+		// Keep only these node_exporter families: CPU (node_cpu_*, load, pressure), memory (node_memory_*,
+		// OOM kills), disk (node_filesystem_* space, node_disk_* IO), network (node_network_*), reboots,
+		// and `up`. Drops node_scrape_collector_* (about 92 per host), netstat, sockstat, xfs, timex, etc.
+		rule {
+			source_labels = ["__name__"]
+			regex         = "up|node_(cpu|memory|pressure|filesystem|disk|network)_.+|node_load(1|5|15)|node_vmstat_oom_kill|node_boot_time_seconds"
+			action        = "keep"
+		}
+
+		// Disk space for real disks only: tmpfs (/run, /tmp) is RAM, and the vfat /boot/efi never changes.
+		// node_disk_* already skips partitions and loop devices (node_exporter's default exclude).
+		rule {
+			source_labels = ["__name__", "fstype"]
+			regex         = "node_filesystem_.+;(tmpfs|ramfs|vfat)"
+			action        = "drop"
+		}
+
+		// Network for the main card (ens5) only: drop loopback, Docker's bridges and every container's
+		// veth (a new veth name on every container restart, so these grow with each deploy).
+		rule {
+			source_labels = ["__name__", "device"]
+			regex         = "node_network_.+;(lo|docker[0-9]+|veth.+|br-.+)"
+			action        = "drop"
+		}
 	}
 
 	export "receiver" {
@@ -26,7 +53,29 @@ declare "containers" {
 	prometheus.relabel "rules" {
 		forward_to = argument.forward_to.value
 
-		// Your rules for the containers' series: which metrics, and which labels change on every deploy?
+		// Keep CPU, memory, memory/CPU limits (container_spec_*), network, and the lifecycle metrics an
+		// incident needs (start time and last seen show restarts, OOM events, Docker health), and `up`.
+		// Drops container_fs_*, blkio, tasks_state, pressure and machine_* / cadvisor_* info.
+		rule {
+			source_labels = ["__name__"]
+			regex         = "up|container_(cpu|memory|network|spec)_.+|container_(start_time_seconds|last_seen|oom_events_total|health_state)"
+			action        = "keep"
+		}
+
+		// Page-fault counts: four series per container, used by nothing.
+		rule {
+			source_labels = ["__name__"]
+			regex         = "container_memory_failures_total"
+			action        = "drop"
+		}
+
+		// Labels that change on every deploy: `id` (the container id), `image` (has the commit tag) and
+		// the copied Docker labels (compose config hash, image digest, OCI revision). `name`
+		// (e.g. lab-app-app-blue-1) stays the same across deploys and tells containers apart, so it stays.
+		rule {
+			regex  = "id|image|container_label_.+"
+			action = "labeldrop"
+		}
 	}
 
 	export "receiver" {
@@ -40,7 +89,13 @@ declare "services" {
 	prometheus.relabel "rules" {
 		forward_to = argument.forward_to.value
 
-		// Your rules for the services' series (contracts/metrics.yaml, Traefik, runtime metrics).
+		// Keep everything (contracts/metrics.yaml, Traefik's metrics, process_*, `up`) except the Go and
+		// Python garbage-collector internals, which no dashboard, rule or canary query uses.
+		rule {
+			source_labels = ["__name__"]
+			regex         = "go_.+|python_gc_.+"
+			action        = "drop"
+		}
 	}
 
 	export "receiver" {

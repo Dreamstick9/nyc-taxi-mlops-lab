@@ -459,7 +459,7 @@
     {
       "id": 13,
       "type": "row",
-      "title": "SLOs (S5: yours to build)",
+      "title": "SLOs (objective 99%, 30 days; observability/slo.yaml)",
       "collapsed": false,
       "gridPos": {
         "x": 0,
@@ -471,18 +471,597 @@
     },
     {
       "id": 14,
-      "type": "text",
-      "title": "Build these",
+      "type": "stat",
+      "title": "/predict availability (not 5xx): SLI and budget",
+      "description": "SLO predict-availability. SLI over the last hour against the 99% objective, and the error budget left over 30 days (100% = untouched, 0% or below = spent). From sli:predict_availability_errors:ratio_rate1h and the raw counters.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "gridPos": {
         "x": 0,
         "y": 44,
-        "w": 24,
-        "h": 5
+        "w": 6,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 0.99
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 0.25
+                    },
+                    {
+                      "color": "green",
+                      "value": 0.5
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
       },
       "options": {
-        "mode": "markdown",
-        "content": "One panel per SLO in `observability/slo.yaml`, from the recording rules in `observability/rules/`:\n\n- the SLI over the last hour against its objective\n- the burn rate (1 h and 5 min), with the alert threshold drawn on it\n\nSave the dashboard, export its JSON over this file, and commit it."
-      }
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "orientation": "vertical",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "1 - sli:predict_availability_errors:ratio_rate1h{slo=\"predict-availability\"}",
+          "legendFormat": "SLI, last hour (objective 99%)",
+          "instant": true
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "1 - (((sum(increase(lab_http_requests_total{route=\"/predict\",code=~\"5..\"}[30d]))) or vector(0)) / (sum(increase(lab_http_requests_total{route=\"/predict\"}[30d])) > 0)) / 0.01",
+          "legendFormat": "Error budget left, 30 days",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "/predict availability (not 5xx): burn rate",
+      "description": "SLO predict-availability. How many times faster than 'exactly on budget' the error budget is burning (error ratio / 0.01). The page fires when 1 h and 5 min are both over 14.4 for 2 min; the ticket when 6 h and 30 min are both over 6 for 15 min (alert PredictAvailabilityBurnRate). Gaps mean no /predict traffic.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 44,
+        "w": 18,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "x",
+          "min": 0,
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line+area"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "transparent",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 6
+              },
+              {
+                "color": "red",
+                "value": 14.4
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sli:predict_availability_errors:ratio_rate1h{slo=\"predict-availability\"} / 0.01",
+          "legendFormat": "1 h (page over 14.4)"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sli:predict_availability_errors:ratio_rate5m{slo=\"predict-availability\"} / 0.01",
+          "legendFormat": "5 min (page over 14.4)"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sli:predict_availability_errors:ratio_rate6h{slo=\"predict-availability\"} / 0.01",
+          "legendFormat": "6 h (ticket over 6)"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sli:predict_availability_errors:ratio_rate30m{slo=\"predict-availability\"} / 0.01",
+          "legendFormat": "30 min (ticket over 6)"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "type": "stat",
+      "title": "/predict latency (under 250 ms): SLI and budget",
+      "description": "SLO predict-latency. SLI over the last hour against the 99% objective, and the error budget left over 30 days (100% = untouched, 0% or below = spent). From sli:predict_latency_errors:ratio_rate1h and the raw counters.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 52,
+        "w": 6,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 0.99
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 0.25
+                    },
+                    {
+                      "color": "green",
+                      "value": 0.5
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "orientation": "vertical",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "1 - sli:predict_latency_errors:ratio_rate1h{slo=\"predict-latency\"}",
+          "legendFormat": "SLI, last hour (objective 99%)",
+          "instant": true
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "1 - ((((sum(increase(lab_http_request_duration_seconds_count{route=\"/predict\"}[30d])) - sum(increase(lab_http_request_duration_seconds_bucket{route=\"/predict\",le=\"0.25\"}[30d])))) or vector(0)) / (sum(increase(lab_http_request_duration_seconds_count{route=\"/predict\"}[30d])) > 0)) / 0.01",
+          "legendFormat": "Error budget left, 30 days",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "/predict latency (under 250 ms): burn rate",
+      "description": "SLO predict-latency. How many times faster than 'exactly on budget' the error budget is burning (error ratio / 0.01). The page fires when 1 h and 5 min are both over 14.4 for 2 min; the ticket when 6 h and 30 min are both over 6 for 15 min (alert PredictLatencyBurnRate). Gaps mean no /predict traffic.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 52,
+        "w": 18,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "x",
+          "min": 0,
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line+area"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "transparent",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 6
+              },
+              {
+                "color": "red",
+                "value": 14.4
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sli:predict_latency_errors:ratio_rate1h{slo=\"predict-latency\"} / 0.01",
+          "legendFormat": "1 h (page over 14.4)"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sli:predict_latency_errors:ratio_rate5m{slo=\"predict-latency\"} / 0.01",
+          "legendFormat": "5 min (page over 14.4)"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sli:predict_latency_errors:ratio_rate6h{slo=\"predict-latency\"} / 0.01",
+          "legendFormat": "6 h (ticket over 6)"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sli:predict_latency_errors:ratio_rate30m{slo=\"predict-latency\"} / 0.01",
+          "legendFormat": "30 min (ticket over 6)"
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "type": "stat",
+      "title": "Quotes from the model (not the fallback): SLI and budget",
+      "description": "SLO predict-model-answered. SLI over the last hour against the 99% objective, and the error budget left over 30 days (100% = untouched, 0% or below = spent). From sli:predict_model_answered_errors:ratio_rate1h and the raw counters.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 60,
+        "w": 6,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 0.99
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 0.25
+                    },
+                    {
+                      "color": "green",
+                      "value": 0.5
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "orientation": "vertical",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "1 - sli:predict_model_answered_errors:ratio_rate1h{slo=\"predict-model-answered\"}",
+          "legendFormat": "SLI, last hour (objective 99%)",
+          "instant": true
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "1 - (((sum(increase(lab_predictions_total{source!=\"model\"}[30d]))) or vector(0)) / (sum(increase(lab_predictions_total[30d])) > 0)) / 0.01",
+          "legendFormat": "Error budget left, 30 days",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "Quotes from the model (not the fallback): burn rate",
+      "description": "SLO predict-model-answered. How many times faster than 'exactly on budget' the error budget is burning (error ratio / 0.01). The page fires when 1 h and 5 min are both over 14.4 for 2 min; the ticket when 6 h and 30 min are both over 6 for 15 min (alert PredictModelAnsweredBurnRate). Gaps mean no /predict traffic.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 60,
+        "w": 18,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "x",
+          "min": 0,
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line+area"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "transparent",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 6
+              },
+              {
+                "color": "red",
+                "value": 14.4
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sli:predict_model_answered_errors:ratio_rate1h{slo=\"predict-model-answered\"} / 0.01",
+          "legendFormat": "1 h (page over 14.4)"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sli:predict_model_answered_errors:ratio_rate5m{slo=\"predict-model-answered\"} / 0.01",
+          "legendFormat": "5 min (page over 14.4)"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sli:predict_model_answered_errors:ratio_rate6h{slo=\"predict-model-answered\"} / 0.01",
+          "legendFormat": "6 h (ticket over 6)"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sli:predict_model_answered_errors:ratio_rate30m{slo=\"predict-model-answered\"} / 0.01",
+          "legendFormat": "30 min (ticket over 6)"
+        }
+      ]
     }
   ],
   "annotations": {

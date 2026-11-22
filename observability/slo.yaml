@@ -1,9 +1,54 @@
 # Service level objectives for the ride app (S5, decision 013). rules/slo.rules.yaml computes them.
 # One entry per SLO: what's measured (the SLI, from contracts/metrics.yaml), the objective, why that
 # number, and the alert that tells you it's being missed.
+#
+# All three are on the rider-facing /predict route, over a 30-day window, summed over every host and
+# both colours (riders don't see blue or green). Objective 99%, so each has an error budget of 1%.
+# Each alert has two rules (rules/slo.rules.yaml): severity=page for a fast burn (14.4x over 1 h and
+# 5 min) and severity=ticket for a slow one (6x over 6 h and 30 min).
 slos:
   - name: predict-availability
     sli:
-    objective:
-    why:
-    alert:
+      description: share of /predict requests the app answered without a 5xx
+      good: sum(rate(lab_http_requests_total{route="/predict",code!~"5.."}[$window]))
+      total: sum(rate(lab_http_requests_total{route="/predict"}[$window]))
+      recorded_as: sli:predict_availability_errors:ratio_rate{5m,30m,1h,6h}  # the error ratio, 1 - SLI
+    objective: 0.99
+    window: 30d
+    # Student: rewrite in your own words.
+    why: >-
+      DRAFT: a 5xx is a rider who asked for a quote and got nothing, the worst thing /predict can do.
+      99% leaves about 7 hours of total outage a month, which a Learner Lab stack (sessions that stop,
+      single hosts, deploys in the day) can actually meet; 99.9% would be spent by one bad deploy.
+    alert: PredictAvailabilityBurnRate
+
+  - name: predict-latency
+    sli:
+      description: share of /predict requests the app answered in under 250 ms (inside the app)
+      good: sum(rate(lab_http_request_duration_seconds_bucket{route="/predict",le="0.25"}[$window]))
+      total: sum(rate(lab_http_request_duration_seconds_count{route="/predict"}[$window]))
+      recorded_as: sli:predict_latency_errors:ratio_rate{5m,30m,1h,6h}  # the error ratio, 1 - SLI
+    objective: 0.99
+    window: 30d
+    # Student: rewrite in your own words.
+    why: >-
+      DRAFT: a quote that takes too long feels broken even when it's right. 250 ms is a histogram bucket
+      edge (contracts/metrics.yaml), so the SLI is exact rather than interpolated, and it's well above
+      a healthy model call, so only real slowness (serving timeouts, a slow model, an overloaded host)
+      spends the budget.
+    alert: PredictLatencyBurnRate
+
+  - name: predict-model-answered
+    sli:
+      description: share of quotes that came from the model, not the static-median fallback
+      good: sum(rate(lab_predictions_total{source="model"}[$window]))
+      total: sum(rate(lab_predictions_total[$window]))
+      recorded_as: sli:predict_model_answered_errors:ratio_rate{5m,30m,1h,6h}  # the error ratio, 1 - SLI
+    objective: 0.99
+    window: 30d
+    # Student: rewrite in your own words.
+    why: >-
+      DRAFT: the fallback keeps /predict returning 200s, so availability alone would hide serving being
+      down. A fallback quote is a worse quote, and this is the SLI that notices; 99% allows the short
+      gaps a model reload or a serving restart causes without paging for them.
+    alert: PredictModelAnsweredBurnRate

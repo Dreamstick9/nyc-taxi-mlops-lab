@@ -65,4 +65,12 @@ module "wiki_secret" {
   description = "Ops wiki URL and this student's token: {\"url\": ..., \"token\": ...}"
 }
 
+# S5: Grafana Cloud remote write. The container only: the value is put from the laptop with
+# aws secretsmanager put-secret-value, so it never touches Terraform state or GitHub.
+module "grafana_secret" {
+  source      = "../modules/secret"
+  name        = "lab/grafana"
+  description = "Grafana Cloud Prometheus remote write: {\"url\": \".../api/prom/push\", \"user\": ..., \"token\": ...}"
+}
+
 

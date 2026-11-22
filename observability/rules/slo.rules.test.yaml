@@ -1,0 +1,265 @@
+# promtool unit tests for slo.rules.yaml (S5, decision 013). `make check` runs them
+# (observability/push-rules.sh --check-only: promtool test rules *.test.yaml).
+#
+# Traffic is 1 /predict request a second (60 a minute) from the live colour unless a test says otherwise.
+# Series notation: `a+bxn` is n+1 samples a, a+b, ..., a+n*b, one per interval; counters are cumulative.
+# Each SLO gets: a sustained outage pages (and later tickets), a 2-minute spike doesn't, and no traffic
+# doesn't.
+rule_files:
+  - slo.rules.yaml
+evaluation_interval: 1m
+
+tests:
+  # ---------------------------------------------------------------- predict-availability
+  - name: availability, sustained outage pages, then tickets
+    interval: 1m
+    input_series:
+      # Healthy for an hour, then every /predict is a 500 from t=61m.
+      - series: 'lab_http_requests_total{route="/predict",method="POST",code="200",host="app",job="app",instance="app-blue:8000"}'
+        values: '0+60x60 3600+0x120'
+      - series: 'lab_http_requests_total{route="/predict",method="POST",code="500",host="app",job="app",instance="app-blue:8000"}'
+        values: '0+0x60 60+60x120'
+      # Other routes don't count.
+      - series: 'lab_http_requests_total{route="/healthz",method="GET",code="200",host="app",job="app",instance="app-blue:8000"}'
+        values: '0+10x180'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: PredictAvailabilityBurnRate
+        exp_alerts: []
+      # 15 minutes in: the page has fired, the ticket (15m for:) hasn't yet.
+      - eval_time: 75m
+        alertname: PredictAvailabilityBurnRate
+        exp_alerts:
+          - exp_labels: { severity: page, slo: predict-availability }
+            exp_annotations:
+              summary: "25.11% of /predict requests were 5xx over the last hour (objective: at most 1%)"
+              description: &avail_page "Page: the availability budget is burning over 14.4x too fast (1 h), and it's still happening (5 min). Check `deploy/web.sh status` (live colour, its tag), `docker ps` and the live app container's logs over SSM, and the \"App responses by route and code\" panel. A deploy just before this? `deploy/web.sh switch` back to the other colour."
+      - eval_time: 120m
+        alertname: PredictAvailabilityBurnRate
+        exp_alerts:
+          - exp_labels: { severity: page, slo: predict-availability }
+            exp_annotations:
+              summary: "100% of /predict requests were 5xx over the last hour (objective: at most 1%)"
+              description: *avail_page
+          - exp_labels: { severity: ticket, slo: predict-availability }
+            exp_annotations:
+              summary: "50% of /predict requests were 5xx over the last 6 hours (objective: at most 1%)"
+              description: &avail_ticket "Ticket: the availability budget is burning over 6x too fast (6 h), still true over 30 min. Not an emergency yet: look at the \"App responses by route and code\" panel and the app containers' logs for a recurring error."
+
+  - name: availability, a 2-minute spike of 5xx doesn't page or ticket
+    interval: 1m
+    input_series:
+      # Healthy, except t=61m and t=62m, when every /predict is a 500.
+      - series: 'lab_http_requests_total{route="/predict",method="POST",code="200",host="app",job="app",instance="app-blue:8000"}'
+        values: '0+60x60 3600 3600 3660+60x117'
+      - series: 'lab_http_requests_total{route="/predict",method="POST",code="500",host="app",job="app",instance="app-blue:8000"}'
+        values: '0+0x60 60 120 120+0x117'
+    alert_rule_test:
+      - { eval_time: 62m, alertname: PredictAvailabilityBurnRate, exp_alerts: [] }
+      - { eval_time: 63m, alertname: PredictAvailabilityBurnRate, exp_alerts: [] }
+      - { eval_time: 65m, alertname: PredictAvailabilityBurnRate, exp_alerts: [] }
+      - { eval_time: 70m, alertname: PredictAvailabilityBurnRate, exp_alerts: [] }
+      - { eval_time: 90m, alertname: PredictAvailabilityBurnRate, exp_alerts: [] }
+      - { eval_time: 180m, alertname: PredictAvailabilityBurnRate, exp_alerts: [] }
+    promql_expr_test:
+      # The 5-minute window alone is over the page threshold: a single-window alert would have paged.
+      - expr: sli:predict_availability_errors:ratio_rate5m > bool (14.4 * 0.01)
+        eval_time: 63m
+        exp_samples:
+          - labels: '{slo="predict-availability"}'
+            value: 1
+      # ...but the hour isn't.
+      - expr: sli:predict_availability_errors:ratio_rate1h > bool (14.4 * 0.01)
+        eval_time: 63m
+        exp_samples:
+          - labels: '{slo="predict-availability"}'
+            value: 0
+
+  - name: availability, blue and green add up into one ratio with no host or colour label
+    interval: 1m
+    input_series:
+      # Both colours take traffic (mid-switch): blue answers 200s, green answers 500s.
+      - series: 'lab_http_requests_total{route="/predict",method="POST",code="200",host="app",job="app",instance="app-blue:8000"}'
+        values: '0+60x60'
+      - series: 'lab_http_requests_total{route="/predict",method="POST",code="500",host="app",job="app",instance="app-green:8000"}'
+        values: '0+60x60'
+      - series: 'lab_http_requests_total{route="/predict",method="POST",code="200",host="app",job="app",instance="app-green:8000"}'
+        values: '0+0x60'
+    promql_expr_test:
+      - expr: sli:predict_availability_errors:ratio_rate5m
+        eval_time: 30m
+        exp_samples:
+          - labels: 'sli:predict_availability_errors:ratio_rate5m{slo="predict-availability"}'
+            value: 0.5
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: PredictAvailabilityBurnRate
+        exp_alerts:
+          - exp_labels: { severity: page, slo: predict-availability }
+            exp_annotations:
+              summary: "50% of /predict requests were 5xx over the last hour (objective: at most 1%)"
+              description: *avail_page
+          - exp_labels: { severity: ticket, slo: predict-availability }
+            exp_annotations:
+              summary: "50% of /predict requests were 5xx over the last 6 hours (objective: at most 1%)"
+              description: *avail_ticket
+
+  # ---------------------------------------------------------------- predict-latency
+  - name: latency, sustained slowness pages, then tickets
+    interval: 1m
+    input_series:
+      # Healthy for an hour (every request under 250 ms), then every request takes longer from t=61m.
+      - series: 'lab_http_request_duration_seconds_bucket{route="/predict",method="POST",le="0.25",host="app",job="app",instance="app-blue:8000"}'
+        values: '0+60x60 3600+0x120'
+      - series: 'lab_http_request_duration_seconds_bucket{route="/predict",method="POST",le="+Inf",host="app",job="app",instance="app-blue:8000"}'
+        values: '0+60x180'
+      - series: 'lab_http_request_duration_seconds_count{route="/predict",method="POST",host="app",job="app",instance="app-blue:8000"}'
+        values: '0+60x180'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: PredictLatencyBurnRate
+        exp_alerts: []
+      - eval_time: 75m
+        alertname: PredictLatencyBurnRate
+        exp_alerts:
+          - exp_labels: { severity: page, slo: predict-latency }
+            exp_annotations:
+              summary: "25.42% of /predict requests took 250 ms or more over the last hour (objective: at most 1%)"
+              description: &lat_page "Page: the latency budget is burning over 14.4x too fast (1 h), and it's still happening (5 min). Check the \"The app's calls to serving, by outcome\" (timeouts?) and \"Serving latency p95\" panels, `deploy/web.sh status`, and the serving containers (`docker ps`, `docker stats`) over SSM."
+      - eval_time: 120m
+        alertname: PredictLatencyBurnRate
+        exp_alerts:
+          - exp_labels: { severity: page, slo: predict-latency }
+            exp_annotations:
+              summary: "100% of /predict requests took 250 ms or more over the last hour (objective: at most 1%)"
+              description: *lat_page
+          - exp_labels: { severity: ticket, slo: predict-latency }
+            exp_annotations:
+              summary: "50% of /predict requests took 250 ms or more over the last 6 hours (objective: at most 1%)"
+              description: &lat_ticket "Ticket: the latency budget is burning over 6x too fast (6 h), still true over 30 min. Look at serving latency by version and the app host's CPU and memory panels for a slow drift."
+
+  - name: latency, a 2-minute spike of slow answers doesn't page or ticket
+    interval: 1m
+    input_series:
+      # Every request at t=61m and t=62m takes 250 ms or more; the le="0.25" bucket stays 120 behind after.
+      - series: 'lab_http_request_duration_seconds_bucket{route="/predict",method="POST",le="0.25",host="app",job="app",instance="app-blue:8000"}'
+        values: '0+60x60 3600 3600 3660+60x117'
+      - series: 'lab_http_request_duration_seconds_count{route="/predict",method="POST",host="app",job="app",instance="app-blue:8000"}'
+        values: '0+60x180'
+    alert_rule_test:
+      - { eval_time: 62m, alertname: PredictLatencyBurnRate, exp_alerts: [] }
+      - { eval_time: 63m, alertname: PredictLatencyBurnRate, exp_alerts: [] }
+      - { eval_time: 65m, alertname: PredictLatencyBurnRate, exp_alerts: [] }
+      - { eval_time: 70m, alertname: PredictLatencyBurnRate, exp_alerts: [] }
+      - { eval_time: 90m, alertname: PredictLatencyBurnRate, exp_alerts: [] }
+      - { eval_time: 180m, alertname: PredictLatencyBurnRate, exp_alerts: [] }
+
+  # ---------------------------------------------------------------- predict-model-answered
+  - name: model-answered, sustained fallback pages, then tickets
+    interval: 1m
+    input_series:
+      # The model answers for an hour, then serving-champion stops and the fallback answers from t=61m.
+      - series: 'lab_predictions_total{source="model",alias="champion",version="3",host="app",job="app",instance="app-blue:8000"}'
+        values: '0+60x60 3600+0x120'
+      - series: 'lab_predictions_total{source="fallback",host="app",job="app",instance="app-blue:8000"}'
+        values: '0+0x60 60+60x120'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: PredictModelAnsweredBurnRate
+        exp_alerts: []
+      - eval_time: 75m
+        alertname: PredictModelAnsweredBurnRate
+        exp_alerts:
+          - exp_labels: { severity: page, slo: predict-model-answered }
+            exp_annotations:
+              summary: "25.11% of quotes came from the fallback, not the model, over the last hour (objective: at most 1%)"
+              description: &model_page "Page: the model-answered budget is burning over 14.4x too fast (1 h), and it's still happening (5 min). Serving is down, slow or has no model: check `deploy/web.sh status` (what serving has loaded), `docker ps` for serving-champion over SSM, and the \"The app's calls to serving, by outcome\" panel (timeout, unavailable, error)."
+      - eval_time: 120m
+        alertname: PredictModelAnsweredBurnRate
+        exp_alerts:
+          - exp_labels: { severity: page, slo: predict-model-answered }
+            exp_annotations:
+              summary: "100% of quotes came from the fallback, not the model, over the last hour (objective: at most 1%)"
+              description: *model_page
+          - exp_labels: { severity: ticket, slo: predict-model-answered }
+            exp_annotations:
+              summary: "50% of quotes came from the fallback, not the model, over the last 6 hours (objective: at most 1%)"
+              description: &model_ticket "Ticket: the model-answered budget is burning over 6x too fast (6 h), still true over 30 min. Look at \"The app's calls to serving, by outcome\" for intermittent timeouts and at serving's reloads."
+
+  - name: model-answered, a 2-minute fallback spike (a reload, say) doesn't page or ticket
+    interval: 1m
+    input_series:
+      - series: 'lab_predictions_total{source="model",alias="champion",version="3",host="app",job="app",instance="app-blue:8000"}'
+        values: '0+60x60 3600 3600 3660+60x117'
+      - series: 'lab_predictions_total{source="fallback",host="app",job="app",instance="app-blue:8000"}'
+        values: '0+0x60 60 120 120+0x117'
+    alert_rule_test:
+      - { eval_time: 62m, alertname: PredictModelAnsweredBurnRate, exp_alerts: [] }
+      - { eval_time: 63m, alertname: PredictModelAnsweredBurnRate, exp_alerts: [] }
+      - { eval_time: 65m, alertname: PredictModelAnsweredBurnRate, exp_alerts: [] }
+      - { eval_time: 70m, alertname: PredictModelAnsweredBurnRate, exp_alerts: [] }
+      - { eval_time: 90m, alertname: PredictModelAnsweredBurnRate, exp_alerts: [] }
+      - { eval_time: 180m, alertname: PredictModelAnsweredBurnRate, exp_alerts: [] }
+
+  # ---------------------------------------------------------------- no traffic
+  - name: no traffic, series exist but nothing moves, nothing fires and no ratio is recorded
+    interval: 1m
+    input_series:
+      # Earlier errors and fallbacks are on the counters, but no request arrives in any window.
+      - series: 'lab_http_requests_total{route="/predict",method="POST",code="200",host="app",job="app",instance="app-blue:8000"}'
+        values: '5000+0x420'
+      - series: 'lab_http_requests_total{route="/predict",method="POST",code="500",host="app",job="app",instance="app-blue:8000"}'
+        values: '900+0x420'
+      - series: 'lab_http_request_duration_seconds_bucket{route="/predict",method="POST",le="0.25",host="app",job="app",instance="app-blue:8000"}'
+        values: '4000+0x420'
+      - series: 'lab_http_request_duration_seconds_count{route="/predict",method="POST",host="app",job="app",instance="app-blue:8000"}'
+        values: '5900+0x420'
+      - series: 'lab_predictions_total{source="model",alias="champion",version="3",host="app",job="app",instance="app-blue:8000"}'
+        values: '4000+0x420'
+      - series: 'lab_predictions_total{source="fallback",host="app",job="app",instance="app-blue:8000"}'
+        values: '1000+0x420'
+    alert_rule_test:
+      - { eval_time: 30m, alertname: PredictAvailabilityBurnRate, exp_alerts: [] }
+      - { eval_time: 30m, alertname: PredictLatencyBurnRate, exp_alerts: [] }
+      - { eval_time: 30m, alertname: PredictModelAnsweredBurnRate, exp_alerts: [] }
+      - { eval_time: 7h, alertname: PredictAvailabilityBurnRate, exp_alerts: [] }
+      - { eval_time: 7h, alertname: PredictLatencyBurnRate, exp_alerts: [] }
+      - { eval_time: 7h, alertname: PredictModelAnsweredBurnRate, exp_alerts: [] }
+    promql_expr_test:
+      - { expr: 'sli:predict_availability_errors:ratio_rate5m', eval_time: 7h, exp_samples: [] }
+      - { expr: 'sli:predict_availability_errors:ratio_rate6h', eval_time: 7h, exp_samples: [] }
+      - { expr: 'sli:predict_latency_errors:ratio_rate1h', eval_time: 7h, exp_samples: [] }
+      - { expr: 'sli:predict_model_answered_errors:ratio_rate1h', eval_time: 7h, exp_samples: [] }
+
+  - name: no traffic, no series at all (the app has never been scraped), nothing fires
+    interval: 1m
+    input_series: []
+    alert_rule_test:
+      - { eval_time: 2h, alertname: PredictAvailabilityBurnRate, exp_alerts: [] }
+      - { eval_time: 2h, alertname: PredictLatencyBurnRate, exp_alerts: [] }
+      - { eval_time: 2h, alertname: PredictModelAnsweredBurnRate, exp_alerts: [] }
+
+  - name: healthy traffic records a zero error ratio, not nothing
+    interval: 1m
+    input_series:
+      - series: 'lab_http_requests_total{route="/predict",method="POST",code="200",host="app",job="app",instance="app-blue:8000"}'
+        values: '0+60x60'
+      - series: 'lab_http_request_duration_seconds_bucket{route="/predict",method="POST",le="0.25",host="app",job="app",instance="app-blue:8000"}'
+        values: '0+60x60'
+      - series: 'lab_http_request_duration_seconds_count{route="/predict",method="POST",host="app",job="app",instance="app-blue:8000"}'
+        values: '0+60x60'
+      - series: 'lab_predictions_total{source="model",alias="champion",version="3",host="app",job="app",instance="app-blue:8000"}'
+        values: '0+60x60'
+    promql_expr_test:
+      - expr: sli:predict_availability_errors:ratio_rate5m
+        eval_time: 30m
+        exp_samples:
+          - { labels: 'sli:predict_availability_errors:ratio_rate5m{slo="predict-availability"}', value: 0 }
+      - expr: sli:predict_latency_errors:ratio_rate5m
+        eval_time: 30m
+        exp_samples:
+          - { labels: 'sli:predict_latency_errors:ratio_rate5m{slo="predict-latency"}', value: 0 }
+      - expr: sli:predict_model_answered_errors:ratio_rate5m
+        eval_time: 30m
+        exp_samples:
+          - { labels: 'sli:predict_model_answered_errors:ratio_rate5m{slo="predict-model-answered"}', value: 0 }
