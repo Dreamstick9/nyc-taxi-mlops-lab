@@ -48,6 +48,7 @@ jobs:
     env:
       SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
       TAG: ${{ inputs.tag }}
+      LLM_HOST: ${{ vars.LLM_HOST }}  # S6: compose.web.yaml passes it to the app (the assistant)
     steps:
       - uses: actions/checkout@v7.0.1
         with:

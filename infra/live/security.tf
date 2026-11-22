@@ -15,6 +15,7 @@ locals {
     llm_chat_from_app        = { to = "llm", from = "app", port = 8080 }
     llm_chat_from_platform   = { to = "llm", from = "platform", port = 8080 }
     llm_embed_from_platform  = { to = "llm", from = "platform", port = 8081 }
+    llm_embed_from_app       = { to = "llm", from = "app", port = 8081 } # S6: the assistant embeds questions
     rds_from_app             = { to = "rds", from = "app", port = 5432 }
     rds_from_platform        = { to = "rds", from = "platform", port = 5432 }
   }

@@ -30,3 +30,8 @@ output "artifact_bucket" {
 output "platform_private_ip" {
   value = module.platform.private_ip
 }
+
+# S6: the app and the platform reach llama.cpp (chat 8080, embeddings 8081) at this IP (LLM_HOST).
+output "llm_private_ip" {
+  value = module.llm.private_ip
+}
