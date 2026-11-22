@@ -114,20 +114,48 @@ async def connect() -> psycopg.AsyncConnection:
                                                  password=s["password"], dbname="rag", autocommit=True, connect_timeout=5)
 
 
-TOP_K = 0  # decision 015
+TOP_K = 2  # decision 015: chunks per answer (no minimum score: the top 2 always go in)
+
+RETRIEVE_SQL = """
+    select c.id, c.page_id, p.title, c.content, 1 - (c.embedding <=> %s::vector) as score
+    from rag.chunks c join rag.pages p on p.id = c.page_id
+    where c.embedding is not null
+    order by c.embedding <=> %s::vector
+    limit %s"""
 
 
 async def retrieve(question_vector: list[float]) -> list[Chunk]:
-    """S6: the chunks closest to the question from rag.chunks (pgvector), best first. Until then: none."""
-    return []
+    """The TOP_K chunks closest to the question in rag.chunks, by cosine distance (the HNSW index's
+    operator, decision 016), best first. score is cosine similarity: 1 is identical."""
+    v = vector_literal(question_vector)
+    async with await connect() as conn, conn.cursor() as cur:
+        await cur.execute(RETRIEVE_SQL, (v, v, TOP_K))
+        rows = await cur.fetchall()
+    return [Chunk(id=r[0], page_id=r[1], title=r[2], content=r[3], score=float(r[4])) for r in rows]
 
 
-SYSTEM_PROMPT = "You are the support assistant of a New York ride-hailing app."
+# Fixed, so llama.cpp can cache it as the prompt's prefix; everything that changes goes in the user turn.
+SYSTEM_PROMPT = (
+    "You are the support assistant of a New York ride-hailing app. Riders ask you about their trips, quotes "
+    "and the company's policies.\n"
+    "Answer only from the wiki excerpts in the rider's message. They are the company's ops wiki, numbered "
+    "[1], [2] and labelled with their page id. Use their exact numbers, names and rules, and cite the page ids "
+    "you used in square brackets, e.g. [airport-buffer].\n"
+    "If the excerpts don't answer the question, say that the company wiki doesn't cover it and suggest the "
+    "rider contacts support. Never guess or invent a policy, a price or a time.\n"
+    "Be friendly."
+)
 
 
 def build_messages(question: str, chunks: list[Chunk]) -> list[dict]:
-    """S6: the prompt. Until then the model answers from what it already knows (nothing about our wiki)."""
-    return [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": question}]
+    """The fixed system prompt, then one user turn: the numbered excerpts (or a note that there are none),
+    then the question."""
+    if chunks:
+        excerpts = "\n\n".join(f"[{i}] {c.page_id} ({c.title}):\n{c.content}" for i, c in enumerate(chunks, 1))
+    else:
+        excerpts = "(no excerpts)"
+    user = f"Wiki excerpts:\n\n{excerpts}\n\nQuestion: {question}"
+    return [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user}]
 
 
 ALLOWED_TOOLS: set[str] = set()  # S7: which of the MCP server's tools the assistant may call
