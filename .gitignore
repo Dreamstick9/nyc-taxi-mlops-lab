@@ -17,3 +17,6 @@ __pycache__/
 .idea/
 .vscode/
 infra/modules/*/.terraform.lock.hcl
+
+# Local Langfuse keys (S6): copied into Secrets Manager lab/langfuse, never committed.
+.langfuse.env

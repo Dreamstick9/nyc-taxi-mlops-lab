@@ -73,4 +73,12 @@ module "grafana_secret" {
   description = "Grafana Cloud Prometheus remote write: {\"url\": \".../api/prom/push\", \"user\": ..., \"token\": ...}"
 }
 
+# S6: Langfuse tracing for the assistant. The container only: the keys are put from the laptop with
+# aws secretsmanager put-secret-value, so they never touch Terraform state or GitHub.
+module "langfuse_secret" {
+  source      = "../modules/secret"
+  name        = "lab/langfuse"
+  description = "Langfuse project keys: {\"host\": \"https://cloud.langfuse.com\", \"public_key\": ..., \"secret_key\": ...}"
+}
+
 
